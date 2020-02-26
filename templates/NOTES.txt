@@ -1,0 +1,6 @@
+
+1. Get cronjob info by running these commands:
+{{- if .Values.global.prometheusConfigUpdator.enabled }}
+  export CRONJOB_NAME=$(kubectl get cronjobs --namespace {{ .Release.Namespace }} -l "app={{ template "prometheus-config-updator.name" . }},release={{ .Release.Name }}"  -o jsonpath="{.items[0].metadata.name}")
+  kubectl describe cronjob $CRONJOB_NAME
+{{- end }}  

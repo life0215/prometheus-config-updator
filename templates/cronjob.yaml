@@ -1,0 +1,143 @@
+{{ if .Values.global.prometheusConfigUpdator.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ template "prometheus-config-updator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ template "prometheus-config-updator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ template "prometheus-config-updator.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ template "prometheus-config-updator.fullname" . }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ template "prometheus-config-updator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+rules:
+  - apiGroups: ["*"]
+    resources: ["secrets","prometheuses", "prometheusrules", "servicemonitors"]
+    verbs: ["create", "get", "list", "patch"]
+---
+apiVersion: batch/v1beta1
+kind: CronJob
+metadata:
+  name: {{ template "prometheus-config-updator.fullname" . }}
+  labels:
+    app: {{ template "prometheus-config-updator.name" . }}
+    chart: {{ template "prometheus-config-updator.chart" . }}
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    "helm.sh/hook": post-install, post-upgrade
+    "helm.sh/hook-weight": "1"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  schedule: "*/5 * * * *"
+  successfulJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: "false"
+        spec:
+          serviceAccountName: {{ template "prometheus-config-updator.fullname" . }}
+          restartPolicy: OnFailure
+          volumes:
+          - name: config
+            emptyDir: {}
+          initContainers:
+          - name: config-puller
+            image: "{{ .Values.image.configPuller.repository }}:{{ .Values.image.configPuller.tag }}"
+            {{- if .Values.global.prometheusConfigUpdator.googleStorage.enabled }}
+            envFrom:
+            - secretRef:
+                name: {{ template "prometheus-config-updator.fullname" . }}-google-storage
+            {{ end -}}
+            volumeMounts:
+            - name: config
+              mountPath: /config
+            imagePullPolicy: {{ .Values.image.configPuller.pullPolicy }}
+            command:
+              - bash
+              - -c
+              - |
+                set -euo pipefail
+                gcloud config set project ${project}
+                gcloud config set compute/zone ${zone}
+                echo "Pulling config file from ${bucketUrl}/${configFile}..."
+                gsutil cp ${bucketUrl}/${configFile} /config/${configFile}
+          containers:
+          - name: {{ .Chart.Name }}
+            image: "{{ .Values.image.kubectl.repository }}:{{ .Values.image.kubectl.tag }}"
+            volumeMounts:
+            - name: config
+              mountPath: /config
+            imagePullPolicy: {{ .Values.image.kubectl.pullPolicy }}
+            command:
+              - bash
+              - -c
+              - |
+                MAX_RETRIES=60
+                function wait_for_access_to_api_server() {
+                    local cnt=0
+                    set +o errexit
+                    while :
+                    do
+                    kubectl version > /dev/null 2>&1
+                    if [[ $? -eq 0 ]]; then
+                        echo "Successfully accessed API Server"
+                        break
+                    else
+                        ((cnt++))
+                        if (( cnt > $MAX_RETRIES )); then
+                        echo "Max retries has been reached (retries $MAX_RETRIES). Exit."
+                        exit 1
+                        fi
+
+                        echo "Cannot access API Server waiting 5s..."
+                        sleep 5
+                    fi
+                    done
+                    set -o errexit
+                }
+
+                # function kill_proxy_and_exit() {
+                #     echo 'killing pilot-agent...'
+                #     curl -XPOST http://127.0.0.1:15020/quitquitquit
+                #     sleep 4
+                #     exit 0
+                # }
+
+                # trap kill_proxy_and_exit ERR EXIT
+
+                echo "Waiting for access to API Server..."
+                wait_for_access_to_api_server
+
+                CONFIG_FILE=/config/{{ .Values.global.prometheusConfigUpdator.googleStorage.configFile }}
+
+                if [ -f $CONFIG_FILE ]; then
+                  echo "Applying configuration..."
+                  cat $CONFIG_FILE
+                  kubectl apply -f $CONFIG_FILE
+                  kubectl patch prometheus monitoring-prometheus --type="merge" -p $'spec:\n additionalScrapeConfigs:\n    name: additional-scrape-configs\n    key: prometheus-additional.yaml'
+                else
+                  echo "$CONFIG_FILE not found.."
+                fi
+{{ end }}
+
+  additionalScrapeConfigs:
+    name: additional-scrape-configs
+    key: prometheus-additional.yaml
